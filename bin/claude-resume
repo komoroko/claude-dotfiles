@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""claude-resume — a thin wrapper that, when you hit a Claude session limit,
+waits until the reset and resumes automatically.
+
+A single-file CLI usable from any project (standard library only, no third-party
+deps). Place it somewhere on PATH (e.g. ~/.local/bin/claude-resume) and mark it
+executable.
+
+Its sole job is "when interrupted by a limit, wait until reset and auto-resume".
+It is not a multi-turn completion driver; it keeps a single logical task alive
+across one or more limit windows.
+
+Usage:
+  claude-resume -p "refactor and make the tests pass"   # headless (recommended); like `claude -p "..."`
+  claude-resume -- claude -p "..."                       # wrap an arbitrary claude command wholesale
+  claude-resume -- make build-loop                       # make AgentLoopTemplate's autonomous build limit-resilient
+  claude-resume --explain limit.txt                      # feed a sample limit message and only show detection/wait math (does not run)
+  claude-resume --self-test                              # built-in logic self-test
+
+Behavior:
+  1. Run the given command (streaming output to the terminal while capturing it).
+  2. exit 0 -> done. Detect a limit signature -> sleep until the reset time and resume. Any other failure -> exit with that exit code.
+  3. Safety valves: a cap on consecutive limit-waits (--max-resumes) and a per-wait maximum (--max-wait-seconds).
+
+Limitations:
+  Reliable detection is only possible on the headless (claude -p) route. The
+  interactive TUI's output at limit time is not machine-readable, so detection is
+  fragile. If the reset time can't be read from the output, it falls back to a
+  fixed backoff (--backoff-seconds) (retrying itself still works).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import select
+import subprocess
+import sys
+import time
+from collections import deque
+from datetime import datetime, timedelta
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python < 3.9 only
+    ZoneInfo = None  # type: ignore[assignment, misc]
+
+
+# --- limit detection (multiple signatures OR'd together; centralized in one place in case wording changes) ---
+
+_LIMIT_PATTERNS = [
+    r"\b(?:session|usage|message) limit\b",
+    r"/upgrade or /usage-credits",
+    r"\brate[_ ]?limit\b",
+    r"too many requests",
+    # A bare "429" invites false positives ("429 files", etc.), so only pick it up when adjacent to rate-limit context.
+    r"\b429\b[^\n]{0,40}(?:rate|limit|too many)|(?:rate|limit|too many)[^\n]{0,40}\b429\b",
+]
+_LIMIT_RE = re.compile("|".join(_LIMIT_PATTERNS), re.IGNORECASE)
+
+
+def detect_limit(text: str) -> bool:
+    """Whether the output text contains a session/usage limit signature."""
+    return bool(_LIMIT_RE.search(text or ""))
+
+
+# --- reset time parsing ------------------------------------------------------------
+
+# e.g. "resets 4:20am (Asia/Tokyo)" / "resets at 16:00 (UTC)" / "resets 4am"
+_TIME_RE = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?", re.IGNORECASE)
+_TIME_RE_24H = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2}):(\d{2})\b")
+# Pick an IANA timezone name (Area/Location) out of the parentheses.
+_TZ_RE = re.compile(r"\(([A-Za-z]+(?:/[A-Za-z0-9_+\-]+)+|UTC|GMT)\)")
+
+
+# Grace so that a reset that just passed (due to processing delay / clock skew) is
+# not pushed to "the next day". A session reset is always in the near future, so
+# anything more than this far in the past is treated as genuinely another day.
+_RESET_PAST_GRACE = timedelta(minutes=15)
+
+
+def _parse_clock(text: str) -> tuple[int, int] | None:
+    """Extract (hour24, minute) from the text. am/pm format preferred, else 24h format.
+
+    When multiple limit messages are present (e.g. at the tail of a transcript),
+    take the **last (most recent)** occurrence.
+    """
+    matches = list(_TIME_RE.finditer(text))
+    if matches:
+        m = matches[-1]
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        half = m.group(3).lower()
+        if hour < 1 or hour > 12:
+            return None
+        if half == "p" and hour != 12:
+            hour += 12
+        elif half == "a" and hour == 12:
+            hour = 0
+        if minute > 59:
+            return None
+        return hour, minute
+    matches = list(_TIME_RE_24H.finditer(text))
+    if matches:
+        m = matches[-1]
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+    return None
+
+
+def parse_reset(text: str, now: datetime) -> datetime | None:
+    """Return the reset time from a limit message as a tz-aware datetime, or None.
+
+    now must be tz-aware. If the message has an IANA timezone, interpret in it;
+    otherwise interpret in now's local tz. On multiple matches, take the latest.
+    If the given time is more than _RESET_PAST_GRACE in the past, treat it as
+    tomorrow (if it only just passed, treat it as immediate = no over-waiting).
+    """
+    clock = _parse_clock(text)
+    if clock is None:
+        return None
+    hour, minute = clock
+
+    tz = None
+    tzms = list(_TZ_RE.finditer(text)) if ZoneInfo is not None else []
+    if tzms:
+        try:
+            tz = ZoneInfo(tzms[-1].group(1))
+        except Exception:
+            tz = None
+
+    base = now.astimezone(tz) if tz is not None else now
+    candidate = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= base - _RESET_PAST_GRACE:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def compute_sleep(reset_dt: datetime, now: datetime, buffer_seconds: float) -> float:
+    """Seconds to wait until reset time + buffer (never negative)."""
+    return max(0.0, (reset_dt - now).total_seconds() + buffer_seconds)
+
+
+def _fmt_dt(dt: datetime) -> str:
+    """Format a tz-aware datetime as "YYYY-MM-DD HH:MM (tz)"."""
+    return f"{dt.strftime('%Y-%m-%d %H:%M')} ({dt.tzinfo})"
+
+
+def parse_start_at(value: str | None, now: datetime) -> datetime | None:
+    """Resolve the --start-at value to a tz-aware datetime.
+
+    Accepted formats:
+      - epoch seconds (e.g. "1782000000" / "1782000000.0")
+      - ISO 8601 (e.g. "2026-07-02T04:20:00+09:00" / "2026-07-02 04:20"). Without a tz, assume now's local tz.
+    Returns None if it can't be resolved.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=now.tzinfo)
+    except (ValueError, OverflowError, OSError):
+        pass
+    try:
+        dt = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=now.tzinfo)
+
+
+# --- resume command assembly -------------------------------------------------------
+
+
+_CONTINUATION_FLAGS = ("--continue", "-c", "--resume", "-r")
+
+
+def build_resume_command(original: list[str], claude_bin: str, resume_prompt: str) -> list[str]:
+    """Decide the command to re-run after a limit.
+
+    - Already has a continuation flag (--resume <id> / --continue) -> **re-run as-is** (preserve session id, model, and other flags)
+    - Head is claude_bin and contains `-p` (headless) -> `claude -p --continue "<resume_prompt>"`
+    - Head is claude_bin (interactive) -> `claude --continue`
+    - Otherwise (e.g. `make build-loop`) -> re-run the original command as-is (the tool handles resuming)
+    """
+    if not original:
+        return original
+    head = os.path.basename(original[0])
+    is_claude = head == os.path.basename(claude_bin) or head == "claude"
+    if not is_claude:
+        return list(original)
+    # If there's already a continuation flag for a specific session, re-run it
+    # as-is without breaking it (don't drop the <id> of `claude --resume <id> -p
+    # ...` or extra flags/prompt).
+    if any(flag in original for flag in _CONTINUATION_FLAGS):
+        return list(original)
+    if "-p" in original or "--print" in original:
+        return [original[0], "-p", "--continue", resume_prompt]
+    return [original[0], "--continue"]
+
+
+# --- execution (tee: stream to terminal while capturing) ---------------------------
+
+
+def run_capture(cmd: list[str]) -> tuple[int, str]:
+    """Run the command and return (returncode, combined output). Output is also streamed to the terminal as-is."""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    # Keep only the last few thousand lines so we don't hoard all output (for
+    # long-running things like make build-loop). But limit/reset lines can appear
+    # far from the tail (when the wrapper spews lots of trailing logs), so any line
+    # matching a signature is also kept separately regardless of position, to avoid
+    # missing detection / reset extraction.
+    tail: deque[str] = deque(maxlen=2000)
+    limit_lines: deque[str] = deque(maxlen=50)
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        tail.append(line)
+        if _LIMIT_RE.search(line):
+            limit_lines.append(line)
+    proc.wait()
+    # Append the limit lines at the tail (the latest comes last, consistent with parse_reset's "take the latest").
+    return proc.returncode, "".join(tail) + "".join(limit_lines)
+
+
+def _log(msg: str) -> None:
+    print(f"[claude-resume] {msg}", file=sys.stderr, flush=True)
+
+
+# --- interactive resume with approval (for visible windows) ------------------------
+
+
+def approve_default_bool(value: str | None) -> bool:
+    """Convert the --approve-default value to bool. yes/y/1/true -> True, else False."""
+    return str(value or "").strip().lower() in ("y", "yes", "1", "true")
+
+
+def resolve_approve_timeout(
+    raw: str | None,
+    reset: datetime | None,
+    now: datetime,
+    *,
+    fallback: float = 120.0,
+) -> float | None:
+    """Decide the wait seconds for the approval prompt.
+
+    - unspecified(None)/"reset" -> wait **until the reset time** (if the reset is
+      unknown, fallback seconds). The window opens at rate_limit time, waits for a
+      human decision until the reset, and if it reaches the reset with no answer it
+      takes the default.
+    - "none"/"" -> None (wait indefinitely). numeric>0 -> that many seconds. "0"/negative -> None (indefinite).
+    - invalid numeric string -> fallback (avoid a typo causing an eternal wait).
+    """
+    s = None if raw is None else str(raw).strip().lower()
+    if s is None or s == "reset":
+        return compute_sleep(reset, now, 0.0) if reset is not None else fallback
+    if s in ("none", ""):
+        return None
+    try:
+        secs = float(s)
+    except ValueError:
+        return fallback
+    return None if secs <= 0 else secs
+
+
+def _stdin_read_timeout(timeout: float | None) -> str | None:
+    """Read one line from stdin. Returns None if no input arrives within timeout seconds (blocks if None = unlimited)."""
+    if timeout is None:
+        return sys.stdin.readline()
+    r, _, _ = select.select([sys.stdin], [], [], timeout)
+    return sys.stdin.readline() if r else None
+
+
+def prompt_approval(
+    reset_dt: datetime | None,
+    timeout: float | None,
+    default: bool,
+    *,
+    reader=None,
+) -> bool:
+    """Ask y/N whether to resume. True if approved.
+
+    - reset_dt: the release (reset) time. For display (None = "unknown").
+    - timeout: seconds. None = wait indefinitely. On timeout, take default.
+    - default: the value taken on empty input / timeout / unrecognized input.
+    - reader: input override for tests (() -> str|None; None = timeout equivalent).
+    On a non-interactive terminal (no TTY), take default immediately (safety valve for the headless fallback).
+    """
+    label = _fmt_dt(reset_dt) if reset_dt is not None else "reset time unknown"
+    default_str = "Y/n" if default else "y/N"
+    dv = "yes" if default else "no"
+    wait = "unlimited" if timeout is None else f"up to {int(timeout)}s"
+    _log(f"Resume confirmation: resume once {label} is reached? [{default_str}] (no answer -> default {dv}, wait {wait})")
+
+    if reader is None and not sys.stdin.isatty():
+        _log(f"Non-interactive terminal; taking default {dv}.")
+        return default
+
+    line = reader() if reader is not None else _stdin_read_timeout(timeout)
+    if line is None:
+        _log(f"No answer (timeout). Taking default {dv}.")
+        return default
+    ans = line.strip().lower()
+    if ans == "":
+        return default
+    if ans in ("y", "yes"):
+        return True
+    if ans in ("n", "no"):
+        return False
+    _log(f"Can't interpret '{ans}'. Taking default {dv}.")
+    return default
+
+
+def run_interactive(cmd: list[str]) -> int:
+    """Interactive resume: inherit stdio and run as-is (no capture; hand the TTY to the child)."""
+    _log(f"Interactive resume: {' '.join(cmd)}")
+    return subprocess.call(cmd)
+
+
+def approve_and_resume(command: list[str], args: argparse.Namespace) -> int:
+    """Approve -> wait until reset -> interactive resume. The body of the `--approve`/`--interactive` route."""
+    now = datetime.now().astimezone()
+    reset = _resolve_start(args, now)
+    if args.approve:
+        timeout = resolve_approve_timeout(getattr(args, "approve_timeout", None), reset, now)
+        default = approve_default_bool(getattr(args, "approve_default", None))
+        if not prompt_approval(reset, timeout, default):
+            _log("Skipping resume (not approved).")
+            return 0
+    wait_until_start(args)
+    if args.dry_run:
+        _log(f"--dry-run: skipping the interactive resume command: {' '.join(command)}")
+        return 0
+    return run_interactive(command)
+
+
+# --- main loop ---------------------------------------------------------------------
+
+
+def _do_sleep(seconds: float, args: argparse.Namespace, sleeper) -> None:
+    """Skip the real sleep on dry-run, otherwise wait via sleeper."""
+    if args.dry_run:
+        _log("--dry-run: skipping the real sleep.")
+    else:
+        sleeper(seconds)
+
+
+def _resolve_start(args: argparse.Namespace, now: datetime) -> datetime | None:
+    """The release time to delay the first run to. Priority: --start-at (explicit) -> --reset-text (extracted from the limit message).
+
+    reset-text is expected to be the payload's last_assistant_message (the limit text itself) passed by the hook.
+    """
+    explicit = parse_start_at(getattr(args, "start_at", None), now)
+    if explicit is not None:
+        return explicit
+    text = getattr(args, "reset_text", None)
+    return parse_reset(text, now) if text else None
+
+
+_WAIT_CHUNK_SECONDS = 300.0  # interval to re-check the wall clock on each wake (absorbs post-suspend sync drift within this window)
+
+
+def wait_until_start(args: argparse.Namespace, *, sleeper=time.sleep) -> None:
+    """Delay the first run until the release time (--start-at / --reset-text). A one-shot wait, not periodic retries.
+
+    **Sleeps in small chunks, re-checking the wall-clock target time on each wake**,
+    so it doesn't miss the target even if the PC suspends (sleeps) while waiting. A
+    single time.sleep depends on CLOCK_MONOTONIC, which stops during suspend, so it
+    can wake earlier/later than the target (especially on WSL2). It won't resume
+    until the target has passed, preventing "resume too early -> immediately hit the
+    limit again".
+    """
+    now = datetime.now().astimezone()
+    start_dt = _resolve_start(args, now)
+    if start_dt is None:
+        return
+    target = start_dt + timedelta(seconds=args.buffer_seconds)
+    total = (target - now).total_seconds()
+    if total <= 0:
+        return
+    if total > args.max_wait_seconds:
+        _log(f"Release time is {int(total)}s away, over the cap --max-wait-seconds={args.max_wait_seconds}s. "
+             f"Waiting only up to the cap.")
+        target = now + timedelta(seconds=args.max_wait_seconds)
+    _log(f"Waiting until release time {_fmt_dt(start_dt)} (about {int((target - now).total_seconds())} seconds).")
+    if args.dry_run:
+        _log("--dry-run: skipping the real sleep.")
+        return
+    # Sleep in small chunks until the wall-clock target passes, re-reading the remaining time each time (suspend-resilient).
+    while True:
+        remaining = (target - datetime.now().astimezone()).total_seconds()
+        if remaining <= 0:
+            return
+        sleeper(min(remaining, _WAIT_CHUNK_SECONDS))
+
+
+def run_loop(cmd: list[str], args: argparse.Namespace, *, runner=run_capture, sleeper=time.sleep) -> int:
+    wait_until_start(args, sleeper=sleeper)
+    resumes = 0
+    current = list(cmd)
+    while True:
+        rc, out = runner(current)
+        if rc == 0:
+            return 0
+        if not detect_limit(out):
+            _log(f"Non-limit failure (rc={rc}). Not retrying.")
+            return rc
+        if resumes >= args.max_resumes:
+            _log(f"Crossed a limit {resumes} times (cap --max-resumes={args.max_resumes}). Aborting.")
+            return rc
+
+        now = datetime.now().astimezone()
+        reset = parse_reset(out, now)
+        if reset is not None:
+            sleep_s = compute_sleep(reset, now, args.buffer_seconds)
+            label = _fmt_dt(reset)
+        else:
+            sleep_s = float(args.backoff_seconds)
+            label = f"couldn't get reset time from output -> fixed backoff {int(sleep_s)}s"
+
+        if sleep_s > args.max_wait_seconds:
+            _log(f"Wait {int(sleep_s)}s exceeds the cap --max-wait-seconds={args.max_wait_seconds}s. Aborting.")
+            return rc
+
+        resumes += 1
+        _log(f"Limit detected ({resumes}/{args.max_resumes}). Waiting until {label} (sleeping {int(sleep_s)} seconds).")
+        _do_sleep(sleep_s, args, sleeper)
+        current = build_resume_command(cmd, args.claude_bin, args.resume_prompt)
+        _log(f"resume: {' '.join(current)}")
+
+
+# --- inspection mode (does not run) / self-test ------------------------------------
+
+
+def explain(path: str, args: argparse.Namespace) -> int:
+    text = sys.stdin.read() if path == "-" else open(path, encoding="utf-8").read()
+    hit = detect_limit(text)
+    print(f"detect_limit: {hit}")
+    if not hit:
+        print("-> No limit signature. Not a retry candidate.")
+        return 0
+    now = datetime.now().astimezone()
+    reset = parse_reset(text, now)
+    if reset is not None:
+        sleep_s = compute_sleep(reset, now, args.buffer_seconds)
+        print(f"parse_reset : {_fmt_dt(reset)}")
+        print(f"sleep       : {int(sleep_s)} seconds (incl. buffer {int(args.buffer_seconds)}s)")
+    else:
+        print("parse_reset : None -> falling back to fixed backoff")
+        print(f"sleep       : {int(args.backoff_seconds)} seconds")
+    return 0
+
+
+def self_test() -> int:
+    failures: list[str] = []
+
+    def check(cond: bool, label: str) -> None:
+        if not cond:
+            failures.append(label)
+
+    # detect_limit
+    check(detect_limit("You've hit your session limit · resets 4:20am (Asia/Tokyo)"), "detect: real message")
+    check(detect_limit("/upgrade or /usage-credits to finish"), "detect: upgrade line")
+    check(detect_limit("API Error: 429 rate_limit_error"), "detect: 429/rate_limit")
+    check(detect_limit("HTTP 429 Too Many Requests"), "detect: 429+context")
+    check(not detect_limit("All tests passed. Done."), "detect: normal output not detected")
+    check(not detect_limit("429 files changed, 12 insertions"), "detect: bare 429 not detected")
+
+    tz_tokyo = ZoneInfo("Asia/Tokyo") if ZoneInfo else None
+    now = datetime(2026, 7, 1, 1, 0, tzinfo=tz_tokyo) if tz_tokyo else datetime(2026, 7, 1, 1, 0).astimezone()
+
+    if tz_tokyo:
+        r = parse_reset("resets 4:20am (Asia/Tokyo)", now)
+        check(r is not None and (r.hour, r.minute) == (4, 20), "parse: 4:20am (Asia/Tokyo)")
+        check(r is not None and str(r.tzinfo) == "Asia/Tokyo", "parse: tz is Asia/Tokyo")
+        # already passed -> next day
+        r2 = parse_reset("resets 4am (Asia/Tokyo)", datetime(2026, 7, 1, 5, 0, tzinfo=tz_tokyo))
+        check(r2 is not None and r2.day == 2 and r2.hour == 4, "parse: passed time -> next day")
+
+    r3 = parse_reset("resets at 16:30 (UTC)", now)
+    check(r3 is not None and (r3.hour, r3.minute) == (16, 30), "parse: 24h format 16:30")
+    r4 = parse_reset("resets 12am", now)  # midnight
+    check(r4 is not None and r4.hour == 0, "parse: 12am=0h")
+    r5 = parse_reset("resets 12pm", now)  # noon
+    check(r5 is not None and r5.hour == 12, "parse: 12pm=12h")
+    check(parse_reset("limit reached, try later", now) is None, "parse: no time -> None")
+    if tz_tokyo:
+        # multiple limit lines -> take the latest (tail)
+        rlast = parse_reset(
+            "resets 1:00am (Asia/Tokyo)\n...\nresets 4:20am (Asia/Tokyo)\n", now
+        )
+        check(rlast is not None and (rlast.hour, rlast.minute) == (4, 20), "parse: multi-line takes latest")
+        # a reset that only just passed (within grace) is not pushed to the next day = immediate
+        r_just = parse_reset("resets 4:20am (Asia/Tokyo)", datetime(2026, 7, 1, 4, 25, tzinfo=tz_tokyo))
+        check(r_just is not None and r_just.day == 1 and r_just.hour == 4, "parse: just-passed is same day (grace)")
+
+    # compute_sleep
+    base = datetime(2026, 7, 1, 1, 0, tzinfo=tz_tokyo) if tz_tokyo else now
+    reset = base + timedelta(hours=3)
+    check(abs(compute_sleep(reset, base, 60) - (3 * 3600 + 60)) < 1, "sleep: 3h+buffer")
+    check(compute_sleep(base - timedelta(hours=1), base, 0) == 0.0, "sleep: past is 0")
+
+    # parse_start_at (absolute release-time specification)
+    epoch = base.timestamp() + 7200
+    s_epoch = parse_start_at(str(epoch), base)
+    check(s_epoch is not None and abs(s_epoch.timestamp() - epoch) < 1, "start-at: epoch resolves")
+    s_iso = parse_start_at("2026-07-02T04:20:00+09:00", base)
+    check(s_iso is not None and (s_iso.hour, s_iso.minute) == (4, 20), "start-at: ISO(with tz) resolves")
+    s_naive = parse_start_at("2026-07-02 04:20", base)
+    check(s_naive is not None and s_naive.tzinfo is not None, "start-at: no-tz gets now's tz")
+    check(parse_start_at("not-a-time", base) is None, "start-at: invalid value -> None")
+    check(parse_start_at(None, base) is None, "start-at: None -> None")
+
+    # _resolve_start (the two routes: start-at -> reset-text)
+    def _ns(**kw):
+        base = dict(start_at=None, reset_text=None)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    r_text = _resolve_start(_ns(reset_text="session limit · resets 6:15am (Asia/Tokyo)"), now)
+    check(r_text is not None and (r_text.hour, r_text.minute) == (6, 15), "resolve: extracted from reset-text")
+    r_startat = _resolve_start(_ns(start_at="2026-07-02T04:20:00+09:00", reset_text="resets 6:15am (Asia/Tokyo)"), now)
+    check(r_startat is not None and (r_startat.hour, r_startat.minute) == (4, 20),
+          "resolve: start-at takes priority over reset-text")
+    check(_resolve_start(_ns(reset_text="text with no time"), now) is None, "resolve: no time -> None")
+    check(_resolve_start(_ns(), now) is None, "resolve: nothing -> None")
+
+    # build_resume_command
+    check(
+        build_resume_command(["claude", "-p", "do X"], "claude", "go")
+        == ["claude", "-p", "--continue", "go"],
+        "resume: headless is -p --continue",
+    )
+    check(
+        build_resume_command(["claude"], "claude", "go") == ["claude", "--continue"],
+        "resume: interactive is --continue",
+    )
+    check(
+        build_resume_command(["make", "build-loop"], "claude", "go") == ["make", "build-loop"],
+        "resume: non-claude re-run as-is",
+    )
+    check(
+        build_resume_command(["claude", "--resume", "SESS", "-p", "x"], "claude", "go")
+        == ["claude", "--resume", "SESS", "-p", "x"],
+        "resume: preserve --resume <id> and re-run as-is",
+    )
+
+    # run_loop (integration check with a fake runner: 1 limit -> resume -> success)
+    calls: list[list[str]] = []
+    seq = iter([(1, "You've hit your session limit · resets 4:20am (Asia/Tokyo)"), (0, "done")])
+
+    def fake_runner(cmd: list[str]) -> tuple[int, str]:
+        calls.append(list(cmd))
+        return next(seq)
+
+    ns = argparse.Namespace(
+        max_resumes=5, max_wait_seconds=10**9, buffer_seconds=60,
+        backoff_seconds=1800, claude_bin="claude", resume_prompt="go", dry_run=True,
+    )
+    rc = run_loop(["claude", "-p", "task"], ns, runner=fake_runner, sleeper=lambda s: None)
+    check(rc == 0, "loop: eventually 0")
+    check(len(calls) == 2 and calls[1] == ["claude", "-p", "--continue", "go"], "loop: 2nd call is the resume command")
+
+    # a non-limit failure returns its rc immediately
+    rc2 = run_loop(["claude", "-p", "x"], ns, runner=lambda c: (3, "compile error"), sleeper=lambda s: None)
+    check(rc2 == 3, "loop: non-limit failure returns rc as-is")
+
+    # resolve_approve_timeout (approval wait = default until reset / explicit values respected / numeric normalized)
+    t_now = datetime(2026, 7, 1, 1, 0, tzinfo=tz_tokyo) if tz_tokyo else now
+    t_reset = t_now + timedelta(hours=3)
+    check(abs(resolve_approve_timeout(None, t_reset, t_now) - 3 * 3600) < 1,
+          "approve-timeout: unspecified is until reset")
+    check(abs(resolve_approve_timeout("reset", t_reset, t_now) - 3 * 3600) < 1,
+          "approve-timeout: 'reset' is until reset")
+    check(resolve_approve_timeout(None, None, t_now) == 120.0,
+          "approve-timeout: unknown reset -> fallback 120")
+    check(resolve_approve_timeout(None, t_now - timedelta(hours=1), t_now) == 0.0,
+          "approve-timeout: past reset -> 0")
+    check(resolve_approve_timeout("none", t_reset, t_now) is None, "approve-timeout: none is unlimited")
+    check(resolve_approve_timeout("0", t_reset, t_now) is None, "approve-timeout: 0 is unlimited")
+    check(resolve_approve_timeout("-5", t_reset, t_now) is None, "approve-timeout: negative is unlimited")
+    check(resolve_approve_timeout("90", t_reset, t_now) == 90.0,
+          "approve-timeout: numeric is that many seconds (priority over reset)")
+    check(resolve_approve_timeout("abc", t_reset, t_now) == 120.0,
+          "approve-timeout: invalid -> fallback (avoid eternal wait)")
+
+    # approve_default_bool
+    check(approve_default_bool("yes") is True, "default: yes is True")
+    check(approve_default_bool("y") is True, "default: y is True")
+    check(approve_default_bool("no") is False, "default: no is False")
+    check(approve_default_bool(None) is False, "default: None is False")
+
+    # prompt_approval (via reader override: yes/no/empty/timeout/unrecognized)
+    reset_dt = datetime(2026, 7, 1, 4, 20, tzinfo=tz_tokyo) if tz_tokyo else now
+    check(prompt_approval(reset_dt, 10, True, reader=lambda: "y\n") is True, "approve: y is True")
+    check(prompt_approval(reset_dt, 10, True, reader=lambda: "no\n") is False, "approve: no is False")
+    check(prompt_approval(reset_dt, 10, True, reader=lambda: "\n") is True, "approve: empty input is default(yes)")
+    check(prompt_approval(reset_dt, 10, False, reader=lambda: "\n") is False, "approve: empty input is default(no)")
+    check(prompt_approval(reset_dt, 10, True, reader=lambda: None) is True, "approve: timeout is default(yes)")
+    check(prompt_approval(reset_dt, 10, False, reader=lambda: None) is False, "approve: timeout is default(no)")
+    check(prompt_approval(reset_dt, 10, False, reader=lambda: "maybe\n") is False, "approve: unrecognized input is default")
+    check(prompt_approval(None, 10, True, reader=lambda: "yes\n") is True, "approve: accepted even with unknown reset")
+
+    if failures:
+        print("SELF-TEST FAILED:", file=sys.stderr)
+        for f in failures:
+            print(f"  - {f}", file=sys.stderr)
+        return 1
+    print("self-test OK (all cases pass)")
+    return 0
+
+
+# --- CLI ---------------------------------------------------------------------------
+
+
+def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+    """Split into wrapper options before `--` and the command to run after it.
+
+    Without `--`, treat the remainder after removing known wrapper options as
+    arguments to `claude` (e.g. `claude-resume -p "..."` -> `claude -p "..."`).
+    """
+    p = argparse.ArgumentParser(
+        prog="claude-resume",
+        description="A thin wrapper that waits until reset and auto-resumes when you hit a Claude session limit.",
+        epilog="e.g. claude-resume -p 'task' / claude-resume -- make build-loop",
+    )
+    p.add_argument("--resume-prompt", default="Continue where you left off.",
+                   help="follow-up text passed to `-p --continue` on resume (default: %(default)s)")
+    p.add_argument("--buffer-seconds", type=float, default=60.0,
+                   help="safety margin seconds added to the reset time (default: %(default)s)")
+    p.add_argument("--max-resumes", type=int, default=12,
+                   help="max consecutive limit-waits (default: %(default)s; wide enough to cover a 5h window even with fixed backoff when the reset time is unknown)")
+    p.add_argument("--max-wait-seconds", type=float, default=21600.0,
+                   help="max wait per attempt; abort if exceeded (default: %(default)s=6h)")
+    p.add_argument("--backoff-seconds", type=float, default=1800.0,
+                   help="fixed backoff seconds when the reset time can't be obtained (default: %(default)s=30m)")
+    p.add_argument("--claude-bin", default="claude", help="path to the claude CLI (default: %(default)s)")
+    p.add_argument("--start-at", default=None, metavar="EPOCH|ISO",
+                   help="wait for the first run until this absolute (release) time. epoch seconds or ISO8601. A one-shot wait, not periodic retries")
+    p.add_argument("--reset-text", default=None, metavar="MESSAGE",
+                   help="extract the reset time from the limit message body (the hook passes the payload's last_assistant_message)")
+    p.add_argument("--approve", action="store_true",
+                   help="present the reset time and ask y/N whether to resume before running (approval at limit time in a visible window)")
+    p.add_argument("--approve-timeout", default=os.environ.get("CLAUDE_RESUME_APPROVE_TIMEOUT"),
+                   metavar="SECONDS|reset|none",
+                   help="wait seconds for the approval prompt. default/`reset` waits until the reset time, none/0 is unlimited, a number is that many seconds"
+                        " (env CLAUDE_RESUME_APPROVE_TIMEOUT)")
+    p.add_argument("--approve-default", default=os.environ.get("CLAUDE_RESUME_APPROVE_DEFAULT", "yes"),
+                   metavar="yes|no",
+                   help="default on no-answer/empty input at the approval prompt (default env CLAUDE_RESUME_APPROVE_DEFAULT -> yes)")
+    p.add_argument("--interactive", action="store_true",
+                   help="run the resume command as-is with inherited stdio (interactive TUI resume; no tee/capture or limit loop)")
+    p.add_argument("--dry-run", action="store_true", help="skip the real sleep (for integration tests with a dummy bin)")
+    p.add_argument("--explain", metavar="FILE",
+                   help="treat FILE (or -=stdin) as a sample limit output, only show detection/wait math, and exit (does not run)")
+    p.add_argument("--self-test", action="store_true", help="run the built-in logic self-test and exit")
+
+    if "--" in argv:
+        idx = argv.index("--")
+        ns = p.parse_args(argv[:idx])
+        return ns, argv[idx + 1 :]
+    # No `--`: take only known options and treat the rest as the command to run.
+    ns, command = p.parse_known_args(argv)
+    return ns, command
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ns, command = parse_args(argv)
+
+    if ns.self_test:
+        return self_test()
+    if ns.explain:
+        return explain(ns.explain, ns)
+
+    if not command:
+        print("No command to run. e.g. claude-resume -p 'task' / claude-resume -- make build-loop",
+              file=sys.stderr)
+        return 2
+
+    # If the head is a claude option (starts with -), prepend claude_bin.
+    if command[0].startswith("-"):
+        command = [ns.claude_bin, *command]
+
+    # Interactive resume with approval (for visible windows): not put through the
+    # headless limit loop; approve -> wait for reset -> stdio-inherited interactive
+    # run, making it observable in a single window.
+    if ns.approve or ns.interactive:
+        return approve_and_resume(command, ns)
+
+    return run_loop(command, ns)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

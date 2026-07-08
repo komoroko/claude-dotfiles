@@ -1,0 +1,640 @@
+#!/usr/bin/env python3
+"""claude-notify — pop a Windows toast **the moment** a Claude Code session/usage
+limit lifts.
+
+A standalone script, separate from the existing auto-resume (claude-resume). It
+piggybacks on the same StopFailure(rate_limit) hook as its trigger (just add
+claude-notify as a second hook command in settings.json).
+
+Its sole job is "when interrupted by a limit, work out the reset time and fire one
+toast when it arrives". It does not resume work (that's claude-resume's job). The
+value of the notification is telling you the **exact moment** of the release, so
+if the reset time can't be obtained it fires no toast and only records it in the
+log (avoiding a guessed, misleading notification).
+
+Runs in two modes:
+  Mode 1 (hook): receives the StopFailure JSON payload on stdin, extracts the
+                 reset time -> launches itself detached in mode 2
+                 (--wait-until <epoch>) -> returns immediately. A hook is a
+                 short-lived process, so it "launches and returns immediately"
+                 (same philosophy as claude-limit-hook).
+  Mode 2 (waiter): follows --wait-until <epoch> (an absolute time) by the wall
+                   clock, and when it arrives fires the toast -> releases the lock.
+                   Because it re-reads now at short intervals, it fires soon after
+                   resume even if the system sleeps (suspends) partway through
+                   (delay-resilient).
+
+Reset-time parsing reuses claude-resume's implementation (parse_reset /
+reset_from_transcript / compute_sleep) loaded via importlib (so the single source
+of truth for tz/am-pm parsing isn't duplicated). If it can't be found, a minimal
+built-in fallback parser is used.
+
+Disable: remove the second command from settings.json, or set env
+CLAUDE_NOTIFY_DISABLE=1.
+Swap the toast mechanism: set env CLAUDE_NOTIFY_TOAST_CMD to any command. The text
+  is passed via env $CLAUDE_TOAST_TITLE / $CLAUDE_TOAST_MESSAGE, so reference those
+  on the command side
+  (e.g. CLAUDE_NOTIFY_TOAST_CMD='notify-send "$CLAUDE_TOAST_TITLE" "$CLAUDE_TOAST_MESSAGE"').
+
+Artifacts are isolated under ~/.claude/limit-notify/: limit-notify.log (a record
+of hook firings/schedules), <key>.out (waiter output). Old .out are auto-deleted
+on startup.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python < 3.9 only
+    ZoneInfo = None  # type: ignore[assignment, misc]
+
+CLAUDE_DIR = Path.home() / ".claude"
+# Isolate the waiter's temp output (.out) and log in this subdirectory so they
+# don't clutter ~/.claude itself. .out files older than this many days are
+# auto-deleted at runtime.
+NOTIFY_DIR = CLAUDE_DIR / "limit-notify"
+LOG = NOTIFY_DIR / "limit-notify.log"
+ARTIFACT_TTL_DAYS = 7
+
+
+def log(msg: str) -> None:
+    try:
+        NOTIFY_DIR.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def prune_artifacts() -> None:
+    """Delete .out files in NOTIFY_DIR older than ARTIFACT_TTL_DAYS.
+    Logs (.log) are exempt. Failures never stop the script itself."""
+    try:
+        cutoff = time.time() - ARTIFACT_TTL_DAYS * 86400
+        for f in NOTIFY_DIR.glob("*.out"):
+            if f.stat().st_mtime < cutoff:
+                f.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+# --- reset time parsing: reuse claude-resume, else built-in fallback ---------------
+
+
+@lru_cache(maxsize=1)
+def _load_resume_module():
+    """Load claude-resume as a module via importlib. None if not found.
+
+    Centralizes the single source of truth for reset parsing including tz/am-pm
+    (parse_reset / reset_from_transcript / compute_sleep) on the claude-resume
+    side, without duplicating it here. Since it's immutable within the process,
+    cache the result (mod / None) to avoid repeated read+exec.
+    """
+    path = (
+        os.environ.get("CLAUDE_RESUME_BIN")
+        or shutil.which("claude-resume")
+        or str(Path.home() / ".local/bin/claude-resume")
+    )
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        spec = importlib.util.spec_from_loader(
+            "claude_resume", loader=None, origin=path
+        )
+        if spec is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # claude-resume is an extensionless script, so exec its source directly.
+        # Set __name__ to "claude_resume" so main() doesn't run under the __main__ guard.
+        src = Path(path).read_text(encoding="utf-8")
+        exec(compile(src, path, "exec"), mod.__dict__)  # noqa: S102 - our own trusted bin
+        return mod
+    except Exception as exc:  # parse failure / syntax differences etc. -> fallback
+        log(f"Failed to load claude-resume (using fallback): {exc}")
+        return None
+
+
+# Built-in fallback (a minimal implementation used only when claude-resume can't be read).
+_FB_TIME_RE = re.compile(
+    r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?", re.IGNORECASE
+)
+_FB_TZ_RE = re.compile(r"\(([A-Za-z]+(?:/[A-Za-z0-9_+\-]+)+|UTC|GMT)\)")
+_FB_PAST_GRACE = timedelta(minutes=15)
+
+
+def _fallback_parse_reset(text: str, now: datetime):
+    """Minimal fallback: only picks up `resets H:MMam (TZ)`. None if not found."""
+    matches = list(_FB_TIME_RE.finditer(text or ""))
+    if not matches:
+        return None
+    m = matches[-1]
+    hour = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    half = m.group(3).lower()
+    if hour < 1 or hour > 12 or minute > 59:
+        return None
+    if half == "p" and hour != 12:
+        hour += 12
+    elif half == "a" and hour == 12:
+        hour = 0
+    tz = None
+    tzms = list(_FB_TZ_RE.finditer(text)) if ZoneInfo is not None else []
+    if tzms:
+        try:
+            tz = ZoneInfo(tzms[-1].group(1))
+        except Exception:
+            tz = None
+    base = now.astimezone(tz) if tz is not None else now
+    candidate = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= base - _FB_PAST_GRACE:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def resolve_reset(text: str, transcript_path: str | None, now: datetime):
+    """Work out the reset time from the payload's last_assistant_message and the transcript. None if not found.
+
+    If claude-resume can be read, use its parse_reset / reset_from_transcript.
+    """
+    mod = _load_resume_module()
+    if mod is not None:
+        reset = mod.parse_reset(text or "", now)
+        if reset is None and transcript_path:
+            reset = mod.reset_from_transcript(transcript_path, now)
+        return reset
+    # fallback
+    reset = _fallback_parse_reset(text or "", now)
+    if reset is None and transcript_path and os.path.isfile(transcript_path):
+        try:
+            size = os.path.getsize(transcript_path)
+            with open(transcript_path, "rb") as fh:
+                if size > 256 * 1024:
+                    fh.seek(-256 * 1024, os.SEEK_END)
+                tail = fh.read().decode("utf-8", errors="replace")
+            reset = _fallback_parse_reset(tail, now)
+        except OSError:
+            pass
+    return reset
+
+
+# --- duplicate-launch guard (same approach as claude-limit-hook's acquire_lock) ----
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # exists but no permission = alive
+        return True
+    return True
+
+
+def acquire_lock(lock: Path) -> bool:
+    """Atomically acquire with O_EXCL. If the existing lock's pid is alive, suppress (False); if dead, take it over."""
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        holder = 0
+        try:
+            holder = int(lock.read_text().strip() or "0")
+        except (OSError, ValueError):
+            holder = 0
+        if _pid_alive(holder):
+            return False
+        try:
+            lock.unlink()
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except (OSError, FileExistsError):
+            return False
+    try:
+        os.write(fd, str(os.getpid()).encode())
+    finally:
+        os.close(fd)
+    return True
+
+
+# --- toast firing ------------------------------------------------------------------
+
+# Default toast: powershell.exe's WinRT ToastNotificationManager (the ToastText02
+# template). Borrowing PowerShell's system AppUserModelID for the AppId is the
+# standard trick that reliably shows a toast on Win10/11 without a custom
+# registration.
+#
+# The text is passed via base64(UTF-8) env vars $CLAUDE_TOAST_TITLE_B64 /
+# $CLAUDE_TOAST_MESSAGE_B64 and decoded as UTF-8 on the PowerShell side. Why: across
+# the WSL->Windows process boundary, (1) a variable's value doesn't arrive unless
+# its name is registered in WSLENV, and (2) raw non-ASCII text is interpreted in
+# Windows' ANSI code page (CP932) and mojibakes. base64 is pure ASCII, so it round-
+# trips independent of the code page and also avoids shell/quoting hell (the WSLENV
+# registration is handled by notify_toast on the Python side).
+_WINRT_TOAST_PS = r"""
+$ErrorActionPreference = 'Stop'
+$title = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:CLAUDE_TOAST_TITLE_B64))
+$msg   = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:CLAUDE_TOAST_MESSAGE_B64))
+$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]
+$null = [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType=WindowsRuntime]
+$null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType=WindowsRuntime]
+$t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$texts = $t.GetElementsByTagName('text')
+[void]$texts.Item(0).AppendChild($t.CreateTextNode($title))
+[void]$texts.Item(1).AppendChild($t.CreateTextNode($msg))
+$appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId)
+$notifier.Show([Windows.UI.Notifications.ToastNotification]::new($t))
+""".strip()
+
+
+def _powershell_bin() -> str | None:
+    return shutil.which("powershell.exe") or (
+        "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+        if os.path.isfile("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+        else None
+    )
+
+
+def _powershell_env(title: str, message: str, base_env: dict[str, str]) -> dict[str, str]:
+    """Build the env for the WinRT toast: base64(UTF-8) text + WSLENV (no side effects = self-testable).
+
+    See the _WINRT_TOAST_PS comment above for why base64+WSLENV. Any existing
+    WSLENV is preserved and our two variable names appended.
+    """
+    def b64(s: str) -> str:
+        return base64.b64encode(s.encode("utf-8")).decode("ascii")
+
+    names = "CLAUDE_TOAST_TITLE_B64:CLAUDE_TOAST_MESSAGE_B64"
+    existing = base_env.get("WSLENV", "")
+    wslenv = f"{existing}:{names}" if existing else names
+    return dict(
+        base_env,
+        CLAUDE_TOAST_TITLE_B64=b64(title),
+        CLAUDE_TOAST_MESSAGE_B64=b64(message),
+        WSLENV=wslenv,
+    )
+
+
+def notify_toast(title: str, message: str, *, dry_run: bool = False) -> bool:
+    """Fire one Windows toast. True on success.
+
+    If CLAUDE_NOTIFY_TOAST_CMD is set, use it. The text is passed via env
+    $CLAUDE_TOAST_TITLE / $CLAUDE_TOAST_MESSAGE (values are not embedded into the
+    command string, so shell injection is impossible). Otherwise use powershell.exe
+    + the WinRT template (this one crosses the WSL boundary via base64(UTF-8)+WSLENV;
+    see _powershell_env).
+    """
+    if dry_run:
+        log(f"[dry] would toast: title={title!r} message={message!r}")
+        print(f"[dry] toast: {title} / {message}")
+        return True
+
+    env = dict(os.environ, CLAUDE_TOAST_TITLE=title, CLAUDE_TOAST_MESSAGE=message)
+
+    custom = os.environ.get("CLAUDE_NOTIFY_TOAST_CMD")
+    if custom:
+        # Pass the text via env only. String-substituting title/message into cmd
+        # could become injection via metacharacters from the cwd, so don't substitute
+        # (reference $CLAUDE_TOAST_* on the command side).
+        try:
+            rc = subprocess.run(
+                ["bash", "-c", custom], env=env, timeout=60
+            ).returncode
+            log(f"custom toast run rc={rc}: {custom}")
+            return rc == 0
+        except (OSError, subprocess.SubprocessError) as exc:
+            log(f"custom toast failed: {exc}")
+            return False
+
+    ps = _powershell_bin()
+    if ps is None:
+        log("powershell.exe not found; can't show a toast.")
+        return False
+    try:
+        proc = subprocess.run(
+            [ps, "-NoProfile", "-NonInteractive", "-Command", _WINRT_TOAST_PS],
+            env=_powershell_env(title, message, env),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            log(f"WinRT toast rc={proc.returncode} stderr={proc.stderr.strip()[:400]}")
+        else:
+            log(f"WinRT toast fired: {title} / {message}")
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"WinRT toast failed: {exc}")
+        return False
+
+
+def _toast_texts(cwd: str, reset_dt: datetime | None) -> tuple[str, str]:
+    """Build the toast (title, message)."""
+    title = "Claude Code — limit lifted"
+    proj = os.path.basename(cwd.rstrip("/")) or cwd or "session"
+    if reset_dt is not None:
+        message = f"{proj} session limit lifted (reset {reset_dt.strftime('%H:%M')})"
+    else:
+        message = f"{proj} session limit lifted"
+    return title, message
+
+
+# --- mode 2: waiter ----------------------------------------------------------------
+
+# Polling interval when following the target by the wall clock. Avoiding a single
+# long sleep and re-reading now at this interval keeps the post-resume delay within
+# this many seconds even across a system suspend (monotonic stall / WSL2 clock drift).
+_POLL_INTERVAL_SECONDS = 60.0
+
+
+def wait_for_target(target: datetime, *, sleeper=time.sleep,
+                    now_fn=lambda: datetime.now().astimezone()) -> None:
+    """Wait until target (an absolute time) arrives, re-reading now at short intervals.
+
+    A single long sleep would stall the monotonic clock during a suspend (incl. WSL2
+    clock drift), delaying firing by that much. Re-reading now each time and
+    recomputing the remainder lets it detect the target's arrival on the next poll
+    after resume, keeping the delay within _POLL_INTERVAL_SECONDS.
+    """
+    while True:
+        remaining = (target - now_fn()).total_seconds()
+        if remaining <= 0:
+            return
+        sleeper(min(remaining, _POLL_INTERVAL_SECONDS))
+
+
+def run_waiter(args: argparse.Namespace, *, sleeper=time.sleep,
+               now_fn=lambda: datetime.now().astimezone()) -> int:
+    """Wait until --wait-until <epoch> and pop the toast."""
+    now = now_fn()
+    target = datetime.fromtimestamp(args.wait_until, tz=now.tzinfo)
+    wait_s = max(0.0, (target - now).total_seconds())
+    if wait_s > args.max_wait_seconds:
+        log(f"Wait {int(wait_s)}s exceeds the cap --max-wait-seconds={int(args.max_wait_seconds)}s. "
+            f"Aborting without a toast.")
+        return 0
+    log(f"waiter: waiting {int(wait_s)}s until {target.strftime('%Y-%m-%d %H:%M')} -> will toast "
+        f"(follows the wall clock in {int(_POLL_INTERVAL_SECONDS)}s steps; suspend-resilient).")
+    if not args.dry_run:
+        wait_for_target(target, sleeper=sleeper, now_fn=now_fn)
+    title, message = _toast_texts(args.cwd or os.getcwd(), target)
+    ok = notify_toast(title, message, dry_run=args.dry_run)
+    log(f"waiter done toast_ok={ok}")
+    return 0
+
+
+# --- mode 1: hook ------------------------------------------------------------------
+
+
+def run_hook(args: argparse.Namespace) -> int:
+    """Work out the reset time from the stdin StopFailure payload and launch the waiter detached."""
+    if os.environ.get("CLAUDE_NOTIFY_DISABLE") == "1":
+        return 0
+
+    raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        payload = {}
+    log(f"hook fired. payload={raw.strip()[:400]}")
+
+    cwd = str(payload.get("cwd") or os.getcwd())
+    if not os.path.isdir(cwd):
+        cwd = os.getcwd()
+    session_id = str(payload.get("session_id") or "")
+    transcript_path = str(payload.get("transcript_path") or args.reset_transcript or "")
+    last_msg = str(payload.get("last_assistant_message") or "")
+
+    now = datetime.now().astimezone()
+    reset = resolve_reset(last_msg, transcript_path or None, now)
+    if reset is None:
+        # Don't pop a guessed toast when the release time is unknown (avoid a misleading notification, protect trust).
+        log("Couldn't determine the reset time. Not scheduling a toast (fail-quiet).")
+        return 0
+
+    key = hashlib.sha1(f"{cwd}|{session_id}".encode()).hexdigest()[:12]
+    lock = Path(f"/tmp/claude-notify-{key}.lock")
+    if not acquire_lock(lock):
+        log(f"Lock present ({lock}). Assuming a waiter is already running; suppressing duplicate schedule.")
+        return 0
+
+    wait_until = reset.timestamp()
+    self_bin = os.path.abspath(sys.argv[0])
+    waiter_cmd = [
+        sys.executable, self_bin, "--waiter",
+        "--wait-until", str(wait_until),
+        "--cwd", cwd,
+        "--max-wait-seconds", str(args.max_wait_seconds),
+    ]
+    bgout = NOTIFY_DIR / f"{key}.out"
+    # The lock is released by a trap when the waiter exits (like claude-limit-hook, exec is not used).
+    lock_q = shlex.quote(str(lock))
+    wrapper = f"trap 'rm -f {lock_q}' EXIT; {shlex.join(waiter_cmd)}"
+    log(f"Launching waiter detached: reset={reset.strftime('%Y-%m-%d %H:%M')} cwd={cwd} "
+        f"session={session_id or '(none)'}")
+    try:
+        with bgout.open("a", encoding="utf-8") as out:
+            proc = subprocess.Popen(
+                ["bash", "-c", wrapper],
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        lock.unlink(missing_ok=True)
+        log(f"Failed to launch waiter: {exc}")
+        return 0
+    try:
+        lock.write_text(str(proc.pid), encoding="utf-8")
+    except OSError:
+        pass
+    return 0
+
+
+# --- self-test ---------------------------------------------------------------------
+
+
+def self_test() -> int:
+    failures: list[str] = []
+
+    def check(cond: bool, label: str) -> None:
+        if not cond:
+            failures.append(label)
+
+    tz_tokyo = ZoneInfo("Asia/Tokyo") if ZoneInfo else None
+    now = (
+        datetime(2026, 7, 1, 1, 0, tzinfo=tz_tokyo)
+        if tz_tokyo
+        else datetime(2026, 7, 1, 1, 0).astimezone()
+    )
+
+    # reset resolution (claude-resume reuse or fallback, both expected to give the same result)
+    r = resolve_reset("You've hit your session limit · resets 4:20am (Asia/Tokyo)", None, now)
+    check(r is not None and (r.hour, r.minute) == (4, 20), "resolve: 4:20am (Asia/Tokyo)")
+    if tz_tokyo:
+        check(r is not None and str(r.tzinfo) == "Asia/Tokyo", "resolve: tz is Asia/Tokyo")
+    check(resolve_reset("no time here", None, now) is None, "resolve: no time -> None")
+
+    # fallback parser standalone
+    fb = _fallback_parse_reset("resets 5:50am (Asia/Tokyo)", now)
+    check(fb is not None and (fb.hour, fb.minute) == (5, 50), "fallback: 5:50am")
+    check(_fallback_parse_reset("resets 12am", now).hour == 0, "fallback: 12am=0h")
+    check(_fallback_parse_reset("resets 12pm", now).hour == 12, "fallback: 12pm=12h")
+    if tz_tokyo:
+        past = _fallback_parse_reset(
+            "resets 4am (Asia/Tokyo)", datetime(2026, 7, 1, 5, 0, tzinfo=tz_tokyo)
+        )
+        check(past is not None and past.day == 2, "fallback: passed time -> next day")
+
+    # text assembly
+    title, msg = _toast_texts("/mnt/d/projects/example-project", now.replace(hour=5, minute=50))
+    check(title == "Claude Code — limit lifted", "toast: title")
+    check("example-project" in msg and "05:50" in msg, "toast: body has project name and time")
+    _, msg2 = _toast_texts("/mnt/d/projects/", None)
+    check("projects" in msg2, "toast: basename even with trailing slash")
+
+    # powershell env: base64(UTF-8) round-trips and WSLENV gets both names (preserving existing WSLENV)
+    t_env = _powershell_env("Claude Code — limit lifted", "example-project lifted (reset 04:20)", {})
+    check(
+        base64.b64decode(t_env["CLAUDE_TOAST_TITLE_B64"]).decode("utf-8")
+        == "Claude Code — limit lifted",
+        "psenv: title round-trips as base64(UTF-8)",
+    )
+    check(
+        base64.b64decode(t_env["CLAUDE_TOAST_MESSAGE_B64"]).decode("utf-8")
+        == "example-project lifted (reset 04:20)",
+        "psenv: message round-trips as base64(UTF-8)",
+    )
+    check(
+        t_env["WSLENV"] == "CLAUDE_TOAST_TITLE_B64:CLAUDE_TOAST_MESSAGE_B64",
+        "psenv: WSLENV has both variable names",
+    )
+    t_env2 = _powershell_env("a", "b", {"WSLENV": "PATH/l"})
+    check(
+        t_env2["WSLENV"] == "PATH/l:CLAUDE_TOAST_TITLE_B64:CLAUDE_TOAST_MESSAGE_B64",
+        "psenv: preserves existing WSLENV and appends",
+    )
+
+    # duplicate lock: 1st acquires, 2nd (live pid) suppressed
+    import tempfile
+    lk = Path(tempfile.mktemp(suffix=".lock"))
+    try:
+        check(acquire_lock(lk) is True, "lock: 1st acquires")
+        # our own pid is written (alive), so the 2nd is False
+        check(acquire_lock(lk) is False, "lock: live pid present is suppressed")
+        # rewriting with a dead pid (a large nonexistent pid) lets it be taken over
+        lk.write_text("999999")
+        check(acquire_lock(lk) is True, "lock: dead pid is taken over")
+    finally:
+        lk.unlink(missing_ok=True)
+
+    # waiter: dry-run with a past time -> immediate toast (no real firing)
+    ns = argparse.Namespace(
+        wait_until=now.timestamp(), cwd="/tmp", max_wait_seconds=21600.0, dry_run=True,
+    )
+    check(run_waiter(ns, sleeper=lambda s: None) == 0, "waiter: dry-run done")
+
+    # wait_for_target: a normal wait follows the wall clock in _POLL_INTERVAL_SECONDS steps
+    base_w = now
+    target_w = base_w + timedelta(seconds=150)
+    clock = [base_w]
+    slept: list[float] = []
+
+    def now_normal():
+        return clock[0]
+
+    def sleep_normal(s: float) -> None:
+        slept.append(s)
+        clock[0] = clock[0] + timedelta(seconds=s)
+
+    wait_for_target(target_w, sleeper=sleep_normal, now_fn=now_normal)
+    check(slept == [60.0, 60.0, 30.0], "waiter: 150s follows in 60/60/30 steps")
+
+    # wait_for_target: across a suspend (the 1st sleep overshoots the target by a lot) -> fires right after resume
+    clock2 = [base_w]
+    slept2: list[float] = []
+
+    def now_suspend():
+        return clock2[0]
+
+    def sleep_suspend(s: float) -> None:
+        slept2.append(s)
+        # Assume the system suspends during the first poll and the wall clock overshoots the target by a lot
+        clock2[0] = base_w + timedelta(hours=5) if len(slept2) == 1 else clock2[0] + timedelta(seconds=s)
+
+    wait_for_target(base_w + timedelta(hours=1), sleeper=sleep_suspend, now_fn=now_suspend)
+    check(slept2 == [60.0], "waiter: even across a suspend, detects arrival on the first poll after resume")
+
+    if failures:
+        print("SELF-TEST FAILED:", file=sys.stderr)
+        for f in failures:
+            print(f"  - {f}", file=sys.stderr)
+        return 1
+    print("self-test OK (all cases pass)")
+    return 0
+
+
+# --- CLI ---------------------------------------------------------------------------
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="claude-notify",
+        description="Pop a Windows toast the moment a Claude Code limit lifts (a standalone notification).",
+    )
+    p.add_argument("--waiter", action="store_true",
+                   help="mode 2 (internal): wait until --wait-until and fire the toast")
+    p.add_argument("--wait-until", type=float, default=None, metavar="EPOCH",
+                   help="the release time the waiter waits for (epoch seconds)")
+    p.add_argument("--cwd", default=None, help="working directory used in the toast text")
+    p.add_argument("--reset-transcript", default=None, metavar="FILE",
+                   help="transcript to extract the reset time from when there is no stdin payload")
+    p.add_argument("--max-wait-seconds", type=float, default=21600.0,
+                   help="max seconds to wait for the release; abort without a toast if exceeded (default: %(default)s=6h)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="skip the real sleep and toast firing (for integration tests)")
+    p.add_argument("--toast-test", action="store_true",
+                   help="pop a test toast right now and exit")
+    p.add_argument("--self-test", action="store_true",
+                   help="run the built-in logic self-test and exit")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(list(sys.argv[1:] if argv is None else argv))
+    prune_artifacts()
+    if args.self_test:
+        return self_test()
+    if args.toast_test:
+        ok = notify_toast("Claude Code — notification test", "Success if this toast appears",
+                          dry_run=args.dry_run)
+        print("toast ok" if ok else "toast failed", file=sys.stderr)
+        return 0 if ok else 1
+    if args.waiter:
+        if args.wait_until is None:
+            print("--waiter requires --wait-until.", file=sys.stderr)
+            return 2
+        return run_waiter(args)
+    return run_hook(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

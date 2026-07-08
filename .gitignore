@@ -1,0 +1,13 @@
+# Backups created at install time
+*.bak.*
+
+# Machine-specific / secret settings never go in the repo
+claude/settings.local.json
+claude/.credentials.json
+
+# Logs and runtime artifacts
+*.log
+
+# Python bytecode cache
+__pycache__/
+*.pyc
