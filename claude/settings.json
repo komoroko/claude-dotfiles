@@ -1,5 +1,11 @@
 {
-  "model": "opus",
+  "model": "claude-sonnet-5",
+  "permissions": {
+    "defaultMode": "auto"
+  },
+  "env": {
+    "CLAUDE_CODE_ENABLE_AUTO_MODE": "1"
+  },
   "hooks": {
     "StopFailure": [
       {
@@ -25,7 +31,8 @@
   "enabledPlugins": {
     "frontend-design@claude-plugins-official": true,
     "github@claude-plugins-official": true,
-    "ui-ux-pro-max@ui-ux-pro-max-skill": true
+    "ui-ux-pro-max@ui-ux-pro-max-skill": true,
+    "natural-japanese@natural-japanese": true
   },
   "extraKnownMarketplaces": {
     "claude-community": {
@@ -44,6 +51,12 @@
       "source": {
         "source": "github",
         "repo": "nextlevelbuilder/ui-ux-pro-max-skill"
+      }
+    },
+    "natural-japanese": {
+      "source": {
+        "source": "github",
+        "repo": "coji/natural-japanese"
       }
     }
   },

@@ -57,6 +57,10 @@ Put anything you don't want to share (API keys, machine-specific paths, etc.) in
   `~/.claude/limit-resume/` and `~/.claude/limit-notify/` so they don't clutter
   `~/.claude` itself. On startup each script auto-deletes `.sh`/`.out` files
   older than `ARTIFACT_TTL_DAYS` (default 7 days); logs are exempt.
+- **Default permission mode is `auto`** (`permissions.defaultMode`). This newer
+  mode has an AI classifier judge the safety of each tool call and
+  auto-approve accordingly; it falls back to normal mode on unsupported
+  environments (model/plan) instead of failing closed.
 
 ## License
 

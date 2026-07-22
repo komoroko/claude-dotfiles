@@ -51,6 +51,7 @@ cd ~/claude-dotfiles
 - **一時ファイルは隔離＋自動削除**。rate_limit 発火ごとに生成されるランチャー/出力は
   `~/.claude/limit-resume/`・`~/.claude/limit-notify/` 配下にまとめ、`~/.claude` 直下を汚さない。
   各スクリプト起動時に `ARTIFACT_TTL_DAYS`（既定7日）より古い `.sh`/`.out` を自動削除する（ログは対象外）。
+- **デフォルトの権限モードは `auto`**（`permissions.defaultMode`）。AI 分類器がツール呼び出しの安全性を判定して自動承認する新モードで、非対応環境（モデル/プラン等）では通常モードへ自動フォールバックするため事故りにくい。
 
 ## ライセンス
 
