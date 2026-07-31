@@ -31,17 +31,47 @@ human_k() {
   awk -v n="$n" 'BEGIN{printf "%dk", (n/1000)+0.5}'
 }
 
+# ---------- Gauges ----------
+c_reset=$'\033[0m'
+c_dim=$'\033[2m'
+c_label=$'\033[2;37m'
+c_val=$'\033[0;36m'
+c_git=$'\033[2;32m'
+c_sep=$'\033[2;90m'
+c_ok=$'\033[0;32m'
+c_warn=$'\033[0;33m'
+c_hot=$'\033[1;31m'
+
+# Colour a gauge by how much of the budget is already spent.
+pct_color() {
+  local p=${1%%.*}
+  case "$p" in ''|*[!0-9]*) p=0 ;; esac
+  if   [ "$p" -ge 90 ]; then printf '%s' "$c_hot"
+  elif [ "$p" -ge 75 ]; then printf '%s' "$c_warn"
+  elif [ "$p" -ge 50 ]; then printf '%s' "$c_val"
+  else                       printf '%s' "$c_ok"
+  fi
+}
+
+# bar <percent> <width> -> filled/empty blocks, coloured by percent
+bar() {
+  local p="$1" w="$2" f e s="" i col
+  f=$(awk -v p="$p" -v w="$w" 'BEGIN{v=int(p*w/100+0.5); if(v>w)v=w; if(v<0)v=0; print v}')
+  e=$((w - f))
+  for ((i=0;i<f;i++)); do s+="█"; done
+  for ((i=0;i<e;i++)); do s+="░"; done
+  col=$(pct_color "$p")
+  printf '%s%s%s%s%s%s' "$c_dim" "[" "$c_reset$col" "$s" "$c_reset$c_dim" "]$c_reset"
+}
+
 context_str=""
 if [ -n "$ctx_total" ] && [ -n "$ctx_input" ]; then
   pct=${ctx_used_pct:-0}
   pct_int=$(awk -v p="$pct" 'BEGIN{printf "%d", p+0.5}')
-  filled=$(( pct_int * 16 / 100 ))
-  [ "$filled" -gt 16 ] && filled=16
-  empty=$((16 - filled))
-  bar=""
-  for ((i=0;i<filled;i++)); do bar+="█"; done
-  for ((i=0;i<empty;i++)); do bar+="░"; done
-  context_str="[$bar] $(human_k "$ctx_input")/$(human_k "$ctx_total") (${pct_int}%)"
+  context_str=$(printf "%s %s%s/%s%s %s%3d%%%s" \
+    "$(bar "$pct_int" 16)" \
+    "$c_dim" "$(human_k "$ctx_input")" "$(human_k "$ctx_total")" "$c_reset" \
+    "$(pct_color "$pct_int")" "$pct_int" "$c_reset")
 fi
 
 # ---------- Line 2 ----------
@@ -67,29 +97,42 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
       remain=$((300 - elapsed))
       if [ "$remain" -gt 0 ]; then
         mm=$((remain / 60)); ss=$((remain % 60))
-        cache_str=$(printf "🟢 %d:%02d" "$mm" "$ss")
+        cache_str=$(printf "%s●%s %d:%02d" "$c_ok" "$c_reset$c_val" "$mm" "$ss")
       else
-        cache_str="⚪ expired"
+        cache_str=$(printf "%s○ expired%s" "$c_dim" "$c_reset")
       fi
     fi
   fi
 fi
 
-# Block: time remaining until the 5-hour rate-limit window resets
+# Block: time remaining until the 5-hour rate-limit window resets,
+# plus the percentage of that window already used.
 block_str=""
+block_left=""
 resets_at=$(get '.rate_limits.five_hour.resets_at')
+five_hour_pct=$(get '.rate_limits.five_hour.used_percentage')
 if [ -n "$resets_at" ]; then
   now_epoch=$(date +%s)
   remain=$(awk -v r="$resets_at" -v n="$now_epoch" 'BEGIN{printf "%d", r-n}')
   if [ "$remain" -gt 0 ]; then
     hh=$((remain / 3600)); mm=$(((remain % 3600) / 60))
-    block_str="${hh}hr ${mm}m"
+    block_left=$(printf "%dh%02dm" "$hh" "$mm")
   fi
+fi
+if [ -n "$five_hour_pct" ]; then
+  bp=$(awk -v p="$five_hour_pct" 'BEGIN{printf "%d", p+0.5}')
+  block_str=$(printf "%s %s%3d%%%s" "$(bar "$bp" 8)" "$(pct_color "$bp")" "$bp" "$c_reset")
+  [ -n "$block_left" ] && block_str+=$(printf " %s↻%s%s" "$c_dim" "$block_left" "$c_reset")
+elif [ -n "$block_left" ]; then
+  block_str=$(printf "%s↻%s%s" "$c_dim" "$block_left" "$c_reset")
 fi
 
 weekly_str=""
 weekly_pct=$(get '.rate_limits.seven_day.used_percentage')
-[ -n "$weekly_pct" ] && weekly_str=$(awk -v p="$weekly_pct" 'BEGIN{printf "%.1f%%", p}')
+if [ -n "$weekly_pct" ]; then
+  wp=$(awk -v p="$weekly_pct" 'BEGIN{printf "%d", p+0.5}')
+  weekly_str=$(printf "%s %s%3d%%%s" "$(bar "$wp" 8)" "$(pct_color "$wp")" "$wp" "$c_reset")
+fi
 
 # Total tokens/s: approximate using output tokens from the last API call
 # divided against session elapsed time (best-effort; requires transcript).
@@ -103,9 +146,10 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
     if [ -n "$first_epoch" ]; then
       elapsed=$((now_epoch - first_epoch))
       [ "$elapsed" -lt 1 ] && elapsed=1
-      raw_total=$(get '.context_window.total_output_tokens')
-      total_tokens=$(( ${raw_total:-0} + 0 ))
-      [ "$total_tokens" -eq 0 ] && total_tokens="$out_tokens"
+      total_tokens="$(get '.context_window.total_output_tokens')"
+      [ -z "$total_tokens" ] && total_tokens=0
+      [ "$total_tokens" -eq 0 ] 2>/dev/null && total_tokens="$out_tokens"
+      [ -z "$total_tokens" ] && total_tokens=0
       total_tps=$(awk -v t="$total_tokens" -v e="$elapsed" 'BEGIN{printf "%.1f t/s", t/e}')
     fi
   fi
@@ -120,7 +164,7 @@ fi
 
 cost_str=""
 if [ -n "$transcript" ] && [ -f "$transcript" ]; then
-  total_cost=$(jq -s '[.[] | .costUSD? // .cost_usd? // empty] | add' "$transcript" 2>/dev/null)
+  total_cost=$(jq -s '[.[] | .costUSD? // .cost_usd? // empty] | add' "$transcript" 2>/dev/null || echo "")
   if [ -n "$total_cost" ] && [ "$total_cost" != "null" ]; then
     cost_str=$(awk -v c="$total_cost" 'BEGIN{printf "$%.2f", c}')
   fi
@@ -131,32 +175,46 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
   skill_str=$(tac "$transcript" 2>/dev/null | jq -r '
     select(.message.content != null) |
     (.message.content[]? | select(.type=="tool_use" and .name=="Skill") | .input.command // .input.skill // .input.name) // empty
-  ' 2>/dev/null | head -n 1)
+  ' 2>/dev/null | head -n 1 || echo "")
 fi
 [ -z "$skill_str" ] && skill_str=$(get '.output_style.name')
 
 # ---------- Render ----------
-c_reset=$'\033[0m'
-c_dim=$'\033[2m'
-c_label=$'\033[2;37m'
-c_val=$'\033[0;36m'
-c_git=$'\033[2;32m'
+sep="${c_sep} │ ${c_reset}"
 
-printf "%sModel:%s %s%-13s%s%sThinking:%s %s%-6s%s%sContext:%s %s\n" \
-  "$c_label" "$c_reset" "$c_val" "$model_name" "$c_reset" \
-  "$c_label" "$c_reset" "$c_val" "$thinking_level" "$c_reset" \
-  "$c_label" "$c_reset" "$context_str"
+# field <label> <value> [pad] -> "label value", value padded before colouring
+field() {
+  local lbl="$1" val="$2" pad="${3:-0}"
+  [ -z "$val" ] && return
+  [ "$pad" -gt 0 ] && val=$(printf "%-*s" "$pad" "$val")
+  printf "%s%s%s %s%s%s" "$c_label" "$lbl" "$c_reset" "$c_val" "$val" "$c_reset"
+}
 
-line2=""
-[ -n "$branch" ] && line2+=$(printf "   %s⎇ %s%-18s%s" "$c_git" "$c_reset$c_val" "$branch" "$c_reset")
-[ -n "$cache_str" ] && line2+=$(printf "%sCache:%s %s%-10s%s" "$c_label" "$c_reset" "$c_val" "$cache_str" "$c_reset")
-[ -n "$block_str" ] && line2+=$(printf "%sBlock:%s %s%s%s  " "$c_label" "$c_reset" "$c_val" "$block_str" "$c_reset")
-[ -n "$weekly_str" ] && line2+=$(printf "                              %sWeekly:%s %s%-8s%s" "$c_label" "$c_reset" "$c_val" "$weekly_str" "$c_reset")
-[ -n "$total_tps" ] && line2+=$(printf " %sTotal:%s %s%s%s" "$c_label" "$c_reset" "$c_val" "$total_tps" "$c_reset")
-printf "%s\n" "$line2"
+# join the non-empty segments with a separator
+join_segs() {
+  local out="" s
+  for s in "$@"; do
+    [ -z "$s" ] && continue
+    [ -n "$out" ] && out+="$sep"
+    out+="$s"
+  done
+  printf '%s' "$out"
+}
 
-line3=$(printf "   %sSession:%s %s%-13s%s%sCost:%s %s%-9s%s%sSkill:%s %s%s%s" \
-  "$c_label" "$c_reset" "$c_val" "$session_name" "$c_reset" \
-  "$c_label" "$c_reset" "$c_val" "${cost_str:-N/A}" "$c_reset" \
-  "$c_label" "$c_reset" "$c_val" "${skill_str:-none}" "$c_reset")
-printf "%s\n" "$line3"
+printf "%s\n" "$(join_segs \
+  "$(field "Model"    "$model_name"     10)" \
+  "$(field "Think"    "$thinking_level"  5)" \
+  "$(printf "%sCtx%s %s" "$c_label" "$c_reset" "$context_str")")"
+
+line2=$(join_segs \
+  "$([ -n "$branch" ] && printf "%s⎇%s %s%s%s" "$c_git" "$c_reset" "$c_val" "$branch" "$c_reset")" \
+  "$([ -n "$cache_str" ] && printf "%sCache%s %s" "$c_label" "$c_reset" "$cache_str")" \
+  "$([ -n "$block_str" ] && printf "%s5h%s %s" "$c_label" "$c_reset" "$block_str")" \
+  "$([ -n "$weekly_str" ] && printf "%s7d%s %s" "$c_label" "$c_reset" "$weekly_str")")
+[ -n "$line2" ] && printf "%s\n" "$line2"
+
+printf "%s\n" "$(join_segs \
+  "$(field "Session" "$session_name"      10)" \
+  "$(field "Cost"    "${cost_str:-N/A}"    8)" \
+  "$(field "Skill"   "${skill_str:-none}" 12)" \
+  "$([ -n "$total_tps" ] && printf "%s%s%s" "$c_dim" "$total_tps" "$c_reset")")"

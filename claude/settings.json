@@ -13,11 +13,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "claude-limit-hook"
+            "command": "$HOME/.local/bin/claude-limit-hook"
           },
           {
             "type": "command",
-            "command": "claude-notify"
+            "command": "$HOME/.local/bin/claude-notify"
           }
         ]
       }
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "rtk hook claude"
+            "command": "$HOME/.local/bin/rtk hook claude"
           }
         ]
       }
@@ -37,7 +37,7 @@
   "workflowKeywordTriggerEnabled": false,
   "statusLine": {
     "type": "command",
-    "command": "claude-statusline"
+    "command": "$HOME/.local/bin/claude-statusline"
   },
   "enabledPlugins": {
     "frontend-design@claude-plugins-official": true,
