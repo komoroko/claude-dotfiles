@@ -13,10 +13,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.local/bin/claude-limit-hook"
-          },
-          {
-            "type": "command",
             "command": "$HOME/.local/bin/claude-notify"
           }
         ]
@@ -43,7 +39,8 @@
     "frontend-design@claude-plugins-official": true,
     "github@claude-plugins-official": true,
     "ui-ux-pro-max@ui-ux-pro-max-skill": true,
-    "natural-japanese@natural-japanese": true
+    "natural-japanese@natural-japanese": true,
+    "skill-creator@claude-community": true
   },
   "extraKnownMarketplaces": {
     "claude-community": {
@@ -72,7 +69,7 @@
     }
   },
   "language": "Japanese",
-  "effortLevel": "high",
+  "effortLevel": "medium",
   "autoCompactEnabled": true,
   "remoteControlAtStartup": true,
   "agentPushNotifEnabled": true
