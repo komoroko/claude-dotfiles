@@ -11,13 +11,12 @@ symlinks created by `install.sh`.
 ```
 claude-dotfiles/
 ├── bin/                     # Executables symlinked into ~/.local/bin (invoked via PATH)
-│   ├── claude-limit-hook    # Dispatcher for the StopFailure(rate_limit) hook
 │   ├── claude-notify        # Windows toast when a limit lifts (WSL only; auto-disabled elsewhere)
-│   ├── claude-resume        # Auto-resume after a limit lifts
-│   └── claude-statusline    # Status line renderer
+│   └── claude-resume        # Manual resume wrapper for after a limit lifts
 ├── claude/                  # Settings symlinked under ~/.claude
-│   └── settings.json        # Claude Code settings (hook / statusLine reference commands by name on PATH)
+│   └── settings.json        # Claude Code settings (hooks are referenced via $HOME/.local/bin/)
 ├── install.sh               # Setup that creates the symlinks (idempotent)
+├── .gitattributes           # Force LF endings (prevents CRLF creeping in from Windows)
 └── .gitignore
 ```
 
@@ -35,8 +34,7 @@ replacing it with a symlink. It is safe to run repeatedly.
 ## Dependencies
 
 - `~/.local/bin` must be on your `PATH`
-- `python3` (claude-limit-hook / claude-notify / claude-resume)
-- `jq`, `bc` (claude-statusline)
+- `python3` (claude-notify / claude-resume)
 - `claude-notify`'s toast notifications are WSL-only. On other systems
   `powershell.exe` is not found and it silently skips.
 
@@ -47,11 +45,21 @@ Put anything you don't want to share (API keys, machine-specific paths, etc.) in
 
 ## Design notes
 
-- **Hook paths are command names only** (`claude-limit-hook`, etc.). Avoiding
-  absolute paths lets them work unchanged on machines with different usernames
-  and home directories (assuming `~/.local/bin` is on PATH).
+- **Hook paths are `$HOME/.local/bin/<name>`.** In some environments the child
+  processes spawned for hooks and the status line do not inherit `~/.local/bin`
+  on their PATH, so a bare command name cannot be resolved. Relying on `$HOME`
+  expansion still keeps things portable across differing usernames.
+- **Line endings are pinned to LF** (`.gitattributes`). When the working tree
+  lives on a Windows drive such as `/mnt/d`, an editor introducing CRLF turns
+  the shebang into `python3\r` and the hook fails silently.
 - **Executables have no file extension.** They follow the Unix convention of
   being shebang'd executables invoked by name from PATH.
+- **Auto-resume is delegated to Claude Code's built-in behavior.** The former
+  `claude-limit-hook` has been removed; this repo now only carries the
+  lift notification (`claude-notify`) and a manual resume wrapper
+  (`claude-resume`).
+- **The status line is [ccstatusline](https://github.com/sirmalloc/ccstatusline).**
+  The home-grown `claude-statusline` has served its purpose and was deleted.
 - **Temporary files are isolated and auto-pruned.** The launchers/outputs
   generated on each rate_limit event are collected under
   `~/.claude/limit-resume/` and `~/.claude/limit-notify/` so they don't clutter

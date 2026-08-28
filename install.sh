@@ -36,7 +36,7 @@ link() {
 
 echo "Repository: $REPO"
 echo ""
-echo "[1/2] Executables (including statusline) -> $BIN_DIR"
+echo "[1/2] Executables -> $BIN_DIR"
 for f in "$REPO"/bin/*; do
   [ -f "$f" ] || continue   # ignore directories such as __pycache__
   link "$f" "$BIN_DIR/$(basename "$f")"
@@ -49,5 +49,5 @@ link "$REPO/claude/settings.json" "$CLAUDE_DIR/settings.json"
 echo ""
 echo "Done. Please verify the following:"
 echo "  - '$BIN_DIR' is on your PATH"
-echo "  - python3 / jq / bc are installed (required commands)"
+echo "  - python3 is installed (required command)"
 echo "  - machine-specific / secret settings go in $CLAUDE_DIR/settings.local.json (gitignored)"

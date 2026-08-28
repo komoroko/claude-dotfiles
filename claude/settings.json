@@ -5,7 +5,7 @@
   "permissions": {
     "defaultMode": "auto"
   },
-  "model": "sonnet",
+  "model": "opus",
   "hooks": {
     "StopFailure": [
       {
@@ -30,14 +30,18 @@
       }
     ]
   },
+  "worktree": {
+    "baseRef": "fresh"
+  },
   "workflowKeywordTriggerEnabled": false,
   "statusLine": {
     "type": "command",
-    "command": "$HOME/.local/bin/claude-statusline"
+    "command": "ccstatusline",
+    "padding": 0,
+    "refreshInterval": 10
   },
   "enabledPlugins": {
     "frontend-design@claude-plugins-official": true,
-    "github@claude-plugins-official": true,
     "ui-ux-pro-max@ui-ux-pro-max-skill": true,
     "natural-japanese@natural-japanese": true,
     "skill-creator@claude-community": true
@@ -68,9 +72,19 @@
       }
     }
   },
+  "outputStyle": "Concise",
   "language": "Japanese",
-  "effortLevel": "medium",
+  "effortLevel": "high",
+  "modelSettings": {
+    "claude-opus-5": {
+      "effortLevel": "high"
+    }
+  },
+  "askUserQuestionTimeout": "never",
+  "editorMode": "normal",
+  "verbose": false,
   "autoCompactEnabled": true,
+  "autoContinueAtUsageLimit": true,
   "remoteControlAtStartup": true,
   "agentPushNotifEnabled": true
 }
