@@ -2,6 +2,11 @@
   "env": {
     "CLAUDE_CODE_ENABLE_AUTO_MODE": "1"
   },
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
+  },
   "permissions": {
     "defaultMode": "auto"
   },
@@ -41,10 +46,12 @@
     "refreshInterval": 10
   },
   "enabledPlugins": {
+    "session-report@claude-plugins-official": true,
     "frontend-design@claude-plugins-official": true,
     "ui-ux-pro-max@ui-ux-pro-max-skill": true,
     "natural-japanese@natural-japanese": true,
-    "skill-creator@claude-community": true
+    "skill-creator@claude-community": true,
+    "typesafe@typesafe-ai": true
   },
   "extraKnownMarketplaces": {
     "claude-community": {
@@ -70,14 +77,22 @@
         "source": "github",
         "repo": "coji/natural-japanese"
       }
+    },
+    "typesafe-ai": {
+      "source": {
+        "source": "github",
+        "repo": "typesafe-ai/skills"
+      }
     }
   },
   "outputStyle": "Concise",
   "language": "Japanese",
-  "effortLevel": "high",
   "modelSettings": {
-    "claude-opus-5": {
-      "effortLevel": "high"
+    "claude-sonnet-5": {
+      "effortLevel": "medium"
+    },
+    "claude-opus-5-5": {
+      "effortLevel": "medium"
     }
   },
   "askUserQuestionTimeout": "never",
