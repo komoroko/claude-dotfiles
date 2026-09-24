@@ -38,8 +38,12 @@ cd ~/claude-dotfiles
 
 ## マシン固有・秘密の設定
 
-共有したくない設定（API キー、マシン固有のパス等）は
-`~/.claude/settings.local.json` に置く。これは symlink 対象外かつ gitignore 済み。
+このリポジトリは公開されているので、公開したくない設定（API キー、リポジトリ名、マシン固有の
+パス、`autoMode` のルールなど）は `claude/settings.json` に書かない。Claude Code はユーザー単位の
+`~/.claude/settings.local.json` を読まない。こうした設定は `/etc/claude-code/managed-settings.d/`
+の下に別ファイルとして置く（例: `sudo install -D -m 644 private.json /etc/claude-code/managed-settings.d/private.json`）。
+Claude Code は起動時にこのファイルとまとめて読み込み、同じキーはこちらが優先される。
+1つのプロジェクトだけの設定は、そのプロジェクトの `.claude/settings.local.json` に置く。
 
 ## 設計メモ
 

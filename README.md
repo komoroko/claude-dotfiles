@@ -40,8 +40,13 @@ replacing it with a symlink. It is safe to run repeatedly.
 
 ## Machine-specific / secret settings
 
-Put anything you don't want to share (API keys, machine-specific paths, etc.) in
-`~/.claude/settings.local.json`. It is not symlinked and is gitignored.
+This repository is public, so `claude/settings.json` must not hold anything you don't want to
+publish (API keys, repository names, machine-specific paths, `autoMode` rules, etc.).
+Claude Code does not read a user-level `~/.claude/settings.local.json`. Put such keys in a
+drop-in file under `/etc/claude-code/managed-settings.d/` instead (for example
+`sudo install -D -m 644 private.json /etc/claude-code/managed-settings.d/private.json`).
+Claude Code merges it with this file at startup, and its keys take precedence over this file.
+Settings for one project go in that project's `.claude/settings.local.json`.
 
 ## Design notes
 

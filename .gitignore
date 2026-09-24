@@ -1,8 +1,7 @@
 # Backups created at install time
 *.bak.*
 
-# Machine-specific / secret settings never go in the repo
-claude/settings.local.json
+# Credentials never go in the repo
 claude/.credentials.json
 
 # Logs and runtime artifacts
